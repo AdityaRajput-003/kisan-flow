@@ -14,9 +14,10 @@ const getApiBaseUrl = () => {
     if (process.env.REACT_APP_API_URL) return process.env.REACT_APP_API_URL;
   }
 
-  // ✅ Use your machine's LAN IP so physical devices & emulators can reach the backend.
-  // Change this if your IP changes (run `ipconfig` to find it).
-  return 'http://10.21.204.4:5000/api';
+  // Use your machine's LAN IP so physical devices & emulators can reach the backend.
+// Change this if your IP changes (run `ipconfig` to find it).
+//return 'http://192.168.29.181:5000/api';
+ return 'http://192.168.29.181:5000/api';
 };
 
 export const API_BASE_URL = getApiBaseUrl();
