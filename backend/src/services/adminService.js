@@ -143,6 +143,139 @@ class AdminService {
       centres: centresSummary,
     };
   }
+
+  /**
+   * Get list of procurement disputes for Admin inspection
+   */
+  async getDisputes() {
+    const disputesRes = await pool.query(
+      `SELECT DISTINCT
+         p.id,
+         p.weight_kg,
+         p.status AS procurement_status,
+         b.crop,
+         u.name AS farmer_name,
+         COALESCE(u.phone, s.farmer_phone) AS farmer_phone,
+         c.name AS centre_name,
+         COALESCE(s.created_at, p.created_at) AS created_at
+       FROM procurements p
+       JOIN bookings b ON p.booking_id = b.id
+       JOIN users u ON b.user_id = u.id
+       JOIN centres c ON b.centre_id = c.id
+       LEFT JOIN sms_verifications s ON s.procurement_id = p.id
+       WHERE p.status = 'DISPUTED'
+       ORDER BY p.id DESC`
+    );
+
+    return disputesRes.rows.map(row => {
+      const isDisputed = row.procurement_status === 'DISPUTED';
+      let formattedTimestamp = String(row.created_at || '');
+      const dateObj = row.created_at ? new Date(row.created_at) : new Date();
+      if (!isNaN(dateObj.getTime())) {
+        const parts = new Intl.DateTimeFormat('en-GB', {
+          timeZone: 'Asia/Kolkata',
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false,
+        }).formatToParts(dateObj);
+        const m = {};
+        for (const p of parts) {
+          m[p.type] = p.value;
+        }
+        const hour = m.hour === '24' ? '00' : m.hour;
+        formattedTimestamp = `${m.year}-${m.month}-${m.day} ${hour}:${m.minute} IST`;
+      }
+
+      return {
+        id: row.id,
+        procurement_id: row.id,
+        farmer_name: row.farmer_name || 'Farmer',
+        farmer_phone: row.farmer_phone || '',
+        centre_name: row.centre_name || '',
+        crop: row.crop || 'Crop',
+        weight_kg: parseFloat(row.weight_kg) || 0,
+        issue: 'Farmer replied 2 (DISPUTE) to post-procurement verification SMS',
+        status: isDisputed ? 'DISPUTED' : 'RESOLVED',
+        timestamp: formattedTimestamp,
+      };
+    });
+  }
+
+  /**
+   * Resolve an existing procurement dispute
+   * @param {number|string} procurementId
+   */
+  async resolveDispute(procurementId) {
+    const numId = Number(procurementId);
+    if (!procurementId || isNaN(numId) || !Number.isInteger(numId) || numId <= 0 || !/^\d+$/.test(String(procurementId).trim())) {
+      const err = new Error(`Invalid procurement ID: ${procurementId}`);
+      err.statusCode = 400;
+      throw err;
+    }
+
+    const client = await pool.connect();
+    let transactionStarted = false;
+    try {
+      await client.query('BEGIN');
+      transactionStarted = true;
+
+      const procCheck = await client.query(
+        'SELECT id, status FROM procurements WHERE id = $1 FOR UPDATE',
+        [numId]
+      );
+
+      if (procCheck.rows.length === 0) {
+        const err = new Error(`Procurement record not found for ID: ${numId}`);
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const procurement = procCheck.rows[0];
+      if (procurement.status !== 'DISPUTED') {
+        const err = new Error(
+          `Procurement #${numId} is not in DISPUTED state (current status: '${procurement.status}')`
+        );
+        err.statusCode = 409;
+        throw err;
+      }
+
+      await client.query(
+        `UPDATE procurements
+         SET status = 'COMPLETED'
+         WHERE id = $1`,
+        [numId]
+      );
+
+      await client.query(
+        `UPDATE sms_verifications
+         SET status = 'CONFIRMED'
+         WHERE procurement_id = $1 AND status = 'DISPUTED'`,
+        [numId]
+      );
+
+      await client.query('COMMIT');
+
+      return {
+        success: true,
+        procurement_id: numId,
+        status: 'RESOLVED',
+      };
+    } catch (err) {
+      if (transactionStarted) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+          console.error('[Admin Service Rollback Error]', rollbackErr.message);
+        }
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
 }
 
 module.exports = new AdminService();

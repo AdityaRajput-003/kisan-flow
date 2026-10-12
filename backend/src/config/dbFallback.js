@@ -635,7 +635,7 @@ function setupDbFallback(pool) {
           return resolve({ rows: [] });
         }
 
-        if (queryStr.includes('FROM payments') && (queryStr.includes('WHERE id = $1') || queryStr.includes('WHERE booking_id = $1') || queryStr.includes('WHERE pm.id = $1'))) {
+        if (queryStr.includes('FROM payments') && (queryStr.includes('WHERE id = $1') || queryStr.includes('booking_id = $1') || queryStr.includes('WHERE pm.id = $1'))) {
           const [id] = params;
           if (!memoryDb.payments) memoryDb.payments = [];
           const payment = memoryDb.payments.find(p => String(p.booking_id) === String(id) || String(p.id) === String(id));
@@ -654,7 +654,14 @@ function setupDbFallback(pool) {
         }
 
         if (queryStr.includes('INSERT INTO sms_verifications')) {
-          const [procurementId, phone, message] = params;
+          let procurementId, phone, message;
+          if (params.length >= 5) {
+            procurementId = params[0];
+            phone = params[3];
+            message = params[4];
+          } else {
+            [procurementId, phone, message] = params;
+          }
           if (!memoryDb.smsVerifications) memoryDb.smsVerifications = [];
           const sms = {
             id: memoryDb.smsVerifications.length + 1,
@@ -676,25 +683,84 @@ function setupDbFallback(pool) {
           const match = memoryDb.smsVerifications
             .slice()
             .reverse()
-            .find(s => s.farmer_phone === phone && s.direction === 'OUTBOUND' && s.status === 'SENT');
+            .find(s => s.farmer_phone === phone && s.direction === 'OUTBOUND' && (s.status === 'SENT' || s.status === 'DELIVERED') && s.procurement_id != null);
           return resolve({ rows: match ? [{ procurement_id: match.procurement_id }] : [] });
         }
 
-        if (queryStr.includes('SELECT id FROM procurements WHERE id = $1')) {
+        if (queryStr.includes('FROM procurements WHERE id = $1')) {
           const [procId] = params;
           if (!memoryDb.procurements) memoryDb.procurements = [];
           const proc = memoryDb.procurements.find(p => String(p.id) === String(procId));
           return resolve({ rows: proc ? [proc] : [] });
         }
 
-        if (queryStr.includes('SELECT id, status, response FROM sms_verifications')) {
+        if (queryStr.includes('UPDATE procurements') && queryStr.includes("SET status = 'DISPUTED'")) {
+          const [procId] = params;
+          if (!memoryDb.procurements) memoryDb.procurements = [];
+          const proc = memoryDb.procurements.find(p => String(p.id) === String(procId));
+          if (proc) proc.status = 'DISPUTED';
+          return resolve({ rows: proc ? [proc] : [] });
+        }
+
+        if (queryStr.includes('UPDATE procurements') && queryStr.includes("SET status = 'COMPLETED'")) {
+          const [procId] = params;
+          if (!memoryDb.procurements) memoryDb.procurements = [];
+          const proc = memoryDb.procurements.find(p => String(p.id) === String(procId));
+          if (proc) proc.status = 'COMPLETED';
+          return resolve({ rows: proc ? [proc] : [] });
+        }
+
+        if (queryStr.includes('FROM procurements p') && (queryStr.includes("p.status = 'DISPUTED'") || queryStr.includes("s.response = '2'"))) {
+          if (!memoryDb.procurements) memoryDb.procurements = [];
+          if (!memoryDb.smsVerifications) memoryDb.smsVerifications = [];
+
+          const rows = [];
+          for (const p of memoryDb.procurements) {
+            if (p.status === 'DISPUTED') {
+              const booking = (memoryDb.bookings || []).find(b => String(b.id) === String(p.booking_id)) || {};
+              const farmer = (memoryDb.users || []).find(u => String(u.id) === String(booking.user_id)) || {};
+              const centre = (memoryDb.centres || []).find(c => String(c.id) === String(booking.centre_id)) || {};
+              const sms = memoryDb.smsVerifications.find(s => String(s.procurement_id) === String(p.id));
+
+              rows.push({
+                id: p.id,
+                weight_kg: p.weight_kg,
+                procurement_status: p.status,
+                crop: booking.crop || 'Wheat',
+                farmer_name: farmer.name || 'Ramesh Kumar',
+                farmer_phone: farmer.phone || (sms ? sms.farmer_phone : '9876543210'),
+                centre_name: centre.name || 'Burdwan Central Procurement Centre',
+                created_at: p.created_at || (sms ? sms.created_at : new Date().toISOString()),
+              });
+            }
+          }
+          return resolve({ rows });
+        }
+
+        if (
+          queryStr.includes('SELECT id, status, response FROM sms_verifications') ||
+          queryStr.includes('SELECT id, status, response, farmer_phone FROM sms_verifications') ||
+          (queryStr.includes('FROM sms_verifications') && queryStr.includes('WHERE procurement_id = $1'))
+        ) {
           const [procId] = params;
           if (!memoryDb.smsVerifications) memoryDb.smsVerifications = [];
           const match = memoryDb.smsVerifications
             .slice()
             .reverse()
             .find(s => String(s.procurement_id) === String(procId) && s.direction === 'OUTBOUND');
-          return resolve({ rows: match ? [match] : [] });
+          if (!match) return resolve({ rows: [] });
+
+          return resolve({ rows: [{ ...match }] });
+        }
+
+        if (queryStr.includes('UPDATE sms_verifications') && queryStr.includes('procurement_id = $1')) {
+          const [procId] = params;
+          if (!memoryDb.smsVerifications) memoryDb.smsVerifications = [];
+          const matched = memoryDb.smsVerifications.filter(s => String(s.procurement_id) === String(procId) && s.status === 'DISPUTED');
+          matched.forEach(s => {
+            s.status = 'CONFIRMED';
+          });
+          return resolve({ rows: matched });
         }
 
         if (queryStr.includes('UPDATE sms_verifications')) {

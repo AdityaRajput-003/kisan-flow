@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Navbar from '../components/Navbar';
 import GovHeader from '../components/GovHeader';
 import TricolorStrip from '../components/TricolorStrip';
@@ -11,9 +11,9 @@ import PaymentEscalation from '../components/PaymentEscalation';
 import PaymentBreakdownBar from '../components/PaymentBreakdownBar';
 import { adminService } from '../services/api';
 import { useLanguage } from '../context/LanguageContext';
-import { 
-  Building2, MessageSquareWarning, AlertOctagon, 
-  RefreshCw, Calendar, ShieldCheck 
+import {
+  Building2, MessageSquareWarning, AlertOctagon,
+  RefreshCw, Calendar, ShieldCheck, CheckCircle2, AlertCircle, X
 } from 'lucide-react';
 
 const AdminDashboard = () => {
@@ -25,17 +25,58 @@ const AdminDashboard = () => {
   const [disputes, setDisputes] = useState([]);
   const [escalations, setEscalations] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [disputeError, setDisputeError] = useState(null);
+  const [disputeSuccess, setDisputeSuccess] = useState(null);
+  const [disputeLoadError, setDisputeLoadError] = useState(null);
+
+  // Track request sequence to prevent overlapping fetches from producing stale/inconsistent state
+  const disputesReqIdRef = useRef(0);
+
+  const fetchDisputes = async () => {
+    const reqId = ++disputesReqIdRef.current;
+    try {
+      const data = await adminService.getDisputes();
+      if (reqId === disputesReqIdRef.current) {
+        if (Array.isArray(data)) {
+          setDisputes(data);
+          setDisputeLoadError(null);
+        }
+      }
+      return data;
+    } catch (err) {
+      if (reqId === disputesReqIdRef.current) {
+        const msg = typeof err === 'string' ? err : (err.message || 'Failed to load disputes');
+        console.error('Failed to load disputes:', err);
+        setDisputeLoadError(msg);
+      }
+      throw err;
+    }
+  };
 
   useEffect(() => {
     loadAllData();
   }, [date]);
 
+  useEffect(() => {
+    if (activeTab === 'disputes') {
+      fetchDisputes().catch(() => {});
+    }
+  }, [activeTab]);
+
   const loadAllData = async () => {
     setLoading(true);
     try {
-      const overviewData = await adminService.getOverview(date);
-      setStats(overviewData);
-      setCentres(overviewData?.centres || []);
+      const [overviewData] = await Promise.allSettled([
+        adminService.getOverview(date),
+        fetchDisputes(),
+      ]);
+
+      if (overviewData.status === 'fulfilled') {
+        setStats(overviewData.value);
+        setCentres(overviewData.value?.centres || []);
+      } else {
+        console.error('Failed to load admin overview', overviewData.reason);
+      }
     } catch (err) {
       console.error('Failed to load admin data', err);
     } finally {
@@ -44,10 +85,32 @@ const AdminDashboard = () => {
   };
 
   const handleResolveDispute = async (procId) => {
-    await adminService.resolveDispute(procId);
-    const updated = await adminService.getDisputes();
-    setDisputes(updated);
+    setDisputeError(null);
+    setDisputeSuccess(null);
+    try {
+      await adminService.resolveDispute(procId);
+      // Keep successful resolution message because backend already confirmed resolution
+      setDisputeSuccess(`Dispute for procurement #${procId} resolved successfully.`);
+
+      const [, overviewRes] = await Promise.allSettled([
+        fetchDisputes(),
+        adminService.getOverview(date),
+      ]);
+
+      // Handle overview refresh independently
+      if (overviewRes.status === 'fulfilled') {
+        setStats(overviewRes.value);
+        setCentres(overviewRes.value?.centres || []);
+      } else {
+        console.warn('Failed to refresh overview after dispute resolution:', overviewRes.reason);
+      }
+    } catch (err) {
+      const msg = typeof err === 'string' ? err : (err.message || 'Failed to resolve dispute');
+      console.error('Failed to resolve dispute:', err);
+      setDisputeError(msg);
+    }
   };
+
 
   const handleForcePay = async (bookingId) => {
     await adminService.forcePay(bookingId);
@@ -178,11 +241,84 @@ const AdminDashboard = () => {
 
         {/* Tab 2: SMS Disputes Panel */}
         {activeTab === 'disputes' && (
-          <div className="space-y-6 animate-fadeIn">
-            <DisputeTable
-              disputes={disputes}
-              onResolve={handleResolveDispute}
-            />
+          <div className="space-y-4 animate-fadeIn">
+            {/* Resolution Success Message */}
+            {disputeSuccess && (
+              <div className="p-3 bg-green-50 border-l-4 border-green-500 text-green-800 text-xs rounded-r flex items-center justify-between shadow-xs">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-green-600 shrink-0" />
+                  <span className="font-semibold">{disputeSuccess}</span>
+                </div>
+                <button
+                  onClick={() => setDisputeSuccess(null)}
+                  className="text-green-700 hover:text-green-900 font-bold p-1 hover:bg-green-100 rounded"
+                  title="Dismiss"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+
+            {/* Resolution Error Message */}
+            {disputeError && (
+              <div className="p-3 bg-red-50 border-l-4 border-red-500 text-red-800 text-xs rounded-r flex items-center justify-between shadow-xs">
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                  <span className="font-semibold">{disputeError}</span>
+                </div>
+                <button
+                  onClick={() => setDisputeError(null)}
+                  className="text-red-700 hover:text-red-900 font-bold p-1 hover:bg-red-100 rounded"
+                  title="Dismiss"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+
+            {/* Loading / Refresh Error Banner */}
+            {disputeLoadError && (
+              <div className="p-3 bg-amber-50 border-l-4 border-amber-500 text-amber-900 text-xs rounded-r flex items-center justify-between shadow-xs">
+                <div className="flex items-center gap-2">
+                  <AlertOctagon className="w-4 h-4 text-amber-600 shrink-0" />
+                  <div>
+                    <span className="font-bold">Failed to load disputes: </span>
+                    <span>{disputeLoadError}</span>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setDisputeLoadError(null);
+                    loadAllData();
+                  }}
+                  className="bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300 px-2.5 py-1 rounded text-xs font-bold transition ml-2 shrink-0 flex items-center gap-1"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  <span>{t.dashboard.refresh}</span>
+                </button>
+              </div>
+            )}
+
+            {/* If load failed and no disputes available, show error state instead of misleading 'No Active Disputes' */}
+            {disputeLoadError && disputes.length === 0 ? (
+              <div className="gov-card rounded-lg shadow-sm border border-red-200 p-8 text-center bg-white">
+                <AlertCircle className="w-8 h-8 text-red-500 mx-auto mb-2" />
+                <h3 className="font-bold text-slate-800 text-sm mb-1">Disputes Unavailable</h3>
+                <p className="text-xs text-slate-500 mb-4">{disputeLoadError}</p>
+                <button
+                  onClick={loadAllData}
+                  className="bg-[#1E3A8A] hover:bg-[#0F2253] text-white px-3.5 py-1.5 rounded text-xs font-bold transition shadow-xs inline-flex items-center gap-1.5 mx-auto"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>{t.dashboard.refresh}</span>
+                </button>
+              </div>
+            ) : (
+              <DisputeTable
+                disputes={disputes}
+                onResolve={handleResolveDispute}
+              />
+            )}
           </div>
         )}
 

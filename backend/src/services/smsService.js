@@ -28,6 +28,36 @@ class SmsService {
   }
 
   /**
+   * Helper to normalize inbound phone numbers to standard 10-digit format for database correlation
+   */
+  normalizeInboundPhone(phone) {
+    if (!phone) return null;
+    const trimmed = String(phone).trim();
+    if (!trimmed) return null;
+
+    const digitsOnly = trimmed.replace(/[^\d]/g, '');
+
+    let candidate = null;
+    // 10-digit Indian mobile number (e.g. 9876543210)
+    if (digitsOnly.length === 10) {
+      candidate = digitsOnly;
+    // 12-digit number with 91 country code (e.g. 919876543210 or +919876543210)
+    } else if (digitsOnly.length === 12 && digitsOnly.startsWith('91')) {
+      candidate = digitsOnly.slice(2);
+    // 11-digit number with leading 0 (e.g. 09876543210)
+    } else if (digitsOnly.length === 11 && digitsOnly.startsWith('0')) {
+      candidate = digitsOnly.slice(1);
+    }
+
+    // Validate Indian mobile number: 10 digits starting with 6, 7, 8, or 9
+    if (candidate && /^[6-9]\d{9}$/.test(candidate)) {
+      return candidate;
+    }
+
+    return null;
+  }
+
+  /**
    * Helper to check if a target recipient is on the verified trial allowlist
    */
   isRecipientVerified(phone) {
@@ -399,85 +429,126 @@ class SmsService {
     }
 
     let targetProcurementId = procurement_id;
-    let targetPhone = from ? from.trim() : null;
+    let targetPhone = from ? this.normalizeInboundPhone(from) : null;
 
-    // Correlation resolution
-    if (!targetProcurementId) {
-      if (!targetPhone) {
-        const err = new Error('Correlation failed: either procurement_id or from phone number must be provided');
-        err.statusCode = 400;
-        throw err;
+    if (!targetProcurementId && !targetPhone) {
+      const err = new Error('Correlation failed: either procurement_id or from phone number must be provided');
+      err.statusCode = 400;
+      throw err;
+    }
+
+    const client = await pool.connect();
+    let transactionStarted = false;
+    try {
+      await client.query('BEGIN');
+      transactionStarted = true;
+
+      // Correlation resolution
+      if (!targetProcurementId) {
+        // Find most recent unconfirmed SMS verification for this phone number
+        const match = await client.query(
+          `SELECT procurement_id
+           FROM sms_verifications
+           WHERE farmer_phone = $1 AND status IN ('SENT', 'DELIVERED') AND direction = 'OUTBOUND' AND procurement_id IS NOT NULL
+           ORDER BY id DESC LIMIT 1`,
+          [targetPhone]
+        );
+
+        if (match.rows.length === 0) {
+          const err = new Error(`No pending SMS verification found for phone: ${targetPhone}`);
+          err.statusCode = 404;
+          throw err;
+        }
+        targetProcurementId = match.rows[0].procurement_id;
       }
 
-      // Find most recent unconfirmed SMS verification for this phone number
-      const match = await pool.query(
-        `SELECT procurement_id 
-         FROM sms_verifications 
-         WHERE farmer_phone = $1 AND status IN ('SENT', 'DELIVERED') AND direction = 'OUTBOUND'
-         ORDER BY id DESC LIMIT 1`,
-        [targetPhone]
+      // Verify procurement exists
+      const procCheck = await client.query(
+        `SELECT id FROM procurements WHERE id = $1`,
+        [targetProcurementId]
       );
 
-      if (match.rows.length === 0) {
-        const err = new Error(`No pending SMS verification found for phone: ${targetPhone}`);
+      if (procCheck.rows.length === 0) {
+        const err = new Error(`Procurement record not found for ID: ${targetProcurementId}`);
         err.statusCode = 404;
         throw err;
       }
-      targetProcurementId = match.rows[0].procurement_id;
-    }
 
-    // Verify procurement exists
-    const procCheck = await pool.query(
-      `SELECT id FROM procurements WHERE id = $1`,
-      [targetProcurementId]
-    );
+      // Find pending outbound SMS verification
+      const verificationRes = await client.query(
+        `SELECT id, status, response, farmer_phone FROM sms_verifications
+         WHERE procurement_id = $1 AND direction = 'OUTBOUND'
+         ORDER BY id DESC LIMIT 1`,
+        [targetProcurementId]
+      );
 
-    if (procCheck.rows.length === 0) {
-      const err = new Error(`Procurement record not found for ID: ${targetProcurementId}`);
-      err.statusCode = 404;
+      if (verificationRes.rows.length === 0) {
+        const err = new Error(`No outbound SMS record found for procurement #${targetProcurementId}`);
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const verification = verificationRes.rows[0];
+
+      // Sender ownership verification when both procurement_id and from are supplied
+      if (procurement_id && from) {
+        const normalizedSender = this.normalizeInboundPhone(from);
+        const normalizedFarmerPhone = this.normalizeInboundPhone(verification.farmer_phone);
+
+        if (!normalizedSender || normalizedSender !== normalizedFarmerPhone) {
+          const err = new Error('Access denied: sender phone number does not match procurement farmer');
+          err.statusCode = 403;
+          throw err;
+        }
+      }
+
+      // Duplicate response check
+      if (verification.status === 'CONFIRMED' || verification.status === 'DISPUTED') {
+        const err = new Error(`Procurement #${targetProcurementId} SMS verification is already resolved as '${verification.status}'`);
+        err.statusCode = 409;
+        throw err;
+      }
+
+      // Update SMS verification status
+      const updateRes = await client.query(
+        `UPDATE sms_verifications
+         SET status = $1, response = $2
+         WHERE id = $3
+         RETURNING id, procurement_id, farmer_phone, direction, response, status, created_at`,
+        [targetStatus, responseCode, verification.id]
+      );
+
+      if (targetStatus === 'DISPUTED') {
+        await client.query(
+          `UPDATE procurements
+           SET status = 'DISPUTED'
+           WHERE id = $1`,
+          [targetProcurementId]
+        );
+      }
+
+      await client.query('COMMIT');
+
+      const updatedVerification = updateRes.rows[0];
+
+      return {
+        procurement_id: targetProcurementId,
+        status: updatedVerification.status,
+        response: updatedVerification.response,
+        updated_at: new Date().toISOString(),
+      };
+    } catch (err) {
+      if (transactionStarted) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+          console.error('[SMS Service Rollback Error]', rollbackErr.message);
+        }
+      }
       throw err;
+    } finally {
+      client.release();
     }
-
-    // Find pending outbound SMS verification
-    const verificationRes = await pool.query(
-      `SELECT id, status, response FROM sms_verifications 
-       WHERE procurement_id = $1 AND direction = 'OUTBOUND' 
-       ORDER BY id DESC LIMIT 1`,
-      [targetProcurementId]
-    );
-
-    if (verificationRes.rows.length === 0) {
-      const err = new Error(`No outbound SMS record found for procurement #${targetProcurementId}`);
-      err.statusCode = 404;
-      throw err;
-    }
-
-    const verification = verificationRes.rows[0];
-
-    // Duplicate response check
-    if (verification.status === 'CONFIRMED' || verification.status === 'DISPUTED') {
-      const err = new Error(`Procurement #${targetProcurementId} SMS verification is already resolved as '${verification.status}'`);
-      err.statusCode = 409;
-      throw err;
-    }
-
-    // Update SMS verification status
-    const updateRes = await pool.query(
-      `UPDATE sms_verifications 
-       SET status = $1, response = $2
-       WHERE id = $3
-       RETURNING id, procurement_id, farmer_phone, direction, response, status, created_at`,
-      [targetStatus, responseCode, verification.id]
-    );
-
-    const updatedVerification = updateRes.rows[0];
-
-    return {
-      procurement_id: targetProcurementId,
-      status: updatedVerification.status,
-      response: updatedVerification.response,
-      updated_at: new Date().toISOString(),
-    };
   }
 }
 

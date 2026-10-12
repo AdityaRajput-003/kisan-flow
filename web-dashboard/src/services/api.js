@@ -221,6 +221,9 @@ export const paymentService = {
   },
 };
 
+// In-flight deduplication promise for getDisputes
+let inFlightDisputesPromise = null;
+
 // 5. Admin Service
 export const adminService = {
   async getOverview(date) {
@@ -233,6 +236,42 @@ export const adminService = {
       throw new Error(response.data?.error || 'Failed to fetch admin overview');
     } catch (err) {
       throw extractErrorMessage(err, 'Failed to fetch admin overview');
+    }
+  },
+
+  async getDisputes() {
+    if (inFlightDisputesPromise) {
+      return inFlightDisputesPromise;
+    }
+    const currentPromise = (async () => {
+      try {
+        const response = await apiClient.get('/admin/disputes');
+        if (response.data?.success) {
+          return response.data.data;
+        }
+        throw new Error(response.data?.error || 'Failed to fetch disputes');
+      } catch (err) {
+        throw extractErrorMessage(err, 'Failed to fetch disputes');
+      } finally {
+        if (inFlightDisputesPromise === currentPromise) {
+          inFlightDisputesPromise = null;
+        }
+      }
+    })();
+    inFlightDisputesPromise = currentPromise;
+    return inFlightDisputesPromise;
+  },
+
+  async resolveDispute(id) {
+    try {
+      const response = await apiClient.patch(`/admin/disputes/${id}/resolve`);
+      if (response.data?.success) {
+        inFlightDisputesPromise = null;
+        return response.data.data;
+      }
+      throw new Error(response.data?.error || 'Failed to resolve dispute');
+    } catch (err) {
+      throw extractErrorMessage(err, 'Failed to resolve dispute');
     }
   },
 };
