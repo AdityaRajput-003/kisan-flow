@@ -46,6 +46,12 @@ class AuthService {
       throw err;
     }
 
+    if (!password || typeof password !== 'string' || password.trim() === '') {
+      const err = new Error('Password is required');
+      err.statusCode = 400;
+      throw err;
+    }
+
     const result = await pool.query(
       'SELECT id, name, phone, role, password_hash FROM users WHERE phone = $1',
       [phone]
@@ -59,23 +65,27 @@ class AuthService {
 
     const user = result.rows[0];
 
-    if (user.password_hash && password) {
-      let isValidPassword = false;
-      if (user.password_hash.startsWith('mock_hash_')) {
-        isValidPassword = user.password_hash === `mock_hash_${password}`;
-      } else {
-        try {
-          isValidPassword = await bcrypt.compare(password, user.password_hash);
-        } catch (e) {
-          isValidPassword = user.password_hash === password;
-        }
-      }
+    if (!user.password_hash) {
+      const err = new Error('Invalid phone number or password');
+      err.statusCode = 401;
+      throw err;
+    }
 
-      if (!isValidPassword) {
-        const err = new Error('Invalid phone number or password');
-        err.statusCode = 401;
-        throw err;
+    let isValidPassword = false;
+    if (user.password_hash.startsWith('mock_hash_')) {
+      isValidPassword = user.password_hash === `mock_hash_${password}`;
+    } else {
+      try {
+        isValidPassword = await bcrypt.compare(password, user.password_hash);
+      } catch (e) {
+        isValidPassword = false;
       }
+    }
+
+    if (!isValidPassword) {
+      const err = new Error('Invalid phone number or password');
+      err.statusCode = 401;
+      throw err;
     }
 
     delete user.password_hash;
